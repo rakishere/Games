@@ -29,6 +29,11 @@ import sys
 import random
 import pygame
 
+try:
+    import numpy as np
+except ImportError:
+    np = None       # sound synthesis disabled; game still runs silently
+
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
@@ -168,6 +173,8 @@ class Player:
         if self.on_ground:
             self.vel_y = JUMP_VELOCITY
             self.on_ground = False
+            return True
+        return False
 
     def update(self, move_dir):
         # horizontal (fore/back)
@@ -308,9 +315,214 @@ def draw_ground(surf, offset):
 
 
 # --------------------------------------------------------------------------
+# Sound — procedurally generated music & effects (no audio files needed)
+# --------------------------------------------------------------------------
+SAMPLE_RATE = 44100
+
+# Note frequencies (Hz)
+_N = {
+    "A3": 220.00, "C4": 261.63, "D4": 293.66, "E4": 329.63, "G4": 392.00,
+    "A4": 440.00, "C5": 523.25, "D5": 587.33, "E5": 659.25, "F5": 698.46,
+    "G5": 783.99, "A5": 880.00, "B5": 987.77, "C6": 1046.50, "REST": 0.0,
+}
+
+
+def _envelope(n, attack=0.005, release=0.04):
+    """Short fade in/out so notes don't click at their edges."""
+    env = np.ones(n)
+    a = min(int(attack * SAMPLE_RATE), n // 2)
+    r = min(int(release * SAMPLE_RATE), n // 2)
+    if a > 0:
+        env[:a] = np.linspace(0.0, 1.0, a)
+    if r > 0:
+        env[-r:] = np.linspace(1.0, 0.0, r)
+    return env
+
+
+def _tone(freq, dur, wave="square", vol=0.3):
+    n = int(dur * SAMPLE_RATE)
+    if n <= 0:
+        return np.zeros(0)
+    if freq <= 0:                                   # a rest
+        return np.zeros(n)
+    t = np.linspace(0.0, dur, n, endpoint=False)
+    if wave == "square":
+        w = np.sign(np.sin(2 * np.pi * freq * t))
+    elif wave == "triangle":
+        w = 2 * np.abs(2 * (t * freq - np.floor(0.5 + t * freq))) - 1
+    elif wave == "saw":
+        w = 2 * (t * freq - np.floor(0.5 + t * freq))
+    else:
+        w = np.sin(2 * np.pi * freq * t)
+    return w * vol * _envelope(n)
+
+
+def _sweep(f0, f1, dur, wave="square", vol=0.3):
+    """A tone whose pitch glides from f0 to f1 (used for jump / hit)."""
+    n = int(dur * SAMPLE_RATE)
+    if n <= 0:
+        return np.zeros(0)
+    freqs = np.linspace(f0, f1, n)
+    phase = 2 * np.pi * np.cumsum(freqs) / SAMPLE_RATE
+    w = np.sign(np.sin(phase)) if wave == "square" else np.sin(phase)
+    return w * vol * _envelope(n)
+
+
+def _seq(notes, beat, wave="square", vol=0.3):
+    """Concatenate a list of (note_name, beats) into one waveform."""
+    parts = [_tone(_N[name], beats * beat, wave, vol) for name, beats in notes]
+    return np.concatenate(parts) if parts else np.zeros(0)
+
+
+def _to_sound(mono):
+    """Turn a mono float waveform (-1..1) into a stereo pygame Sound."""
+    mono = np.clip(mono, -1.0, 1.0)
+    samples = (mono * 32767).astype(np.int16)
+    stereo = np.ascontiguousarray(np.column_stack([samples, samples]))
+    return pygame.sndarray.make_sound(stereo)
+
+
+def _build_music():
+    beat = 0.15
+    lead = _seq([
+        ("C5", 1), ("E5", 1), ("G5", 1), ("E5", 1), ("C5", 1), ("E5", 1), ("G5", 1), ("A5", 1),
+        ("G5", 1), ("E5", 1), ("C5", 1), ("E5", 1), ("D5", 1), ("F5", 1), ("A5", 1), ("F5", 1),
+        ("C5", 1), ("E5", 1), ("G5", 1), ("E5", 1), ("C5", 1), ("E5", 1), ("G5", 1), ("A5", 1),
+        ("G5", 1), ("E5", 1), ("D5", 1), ("C5", 1), ("G4", 1), ("C5", 1), ("E5", 1), ("G4", 1),
+    ], beat, wave="square", vol=0.32)
+    bass = _seq([
+        ("C4", 4), ("C4", 4), ("A3", 4), ("D4", 4),
+        ("C4", 4), ("C4", 4), ("G4", 4), ("C4", 4),
+    ], beat, wave="triangle", vol=0.45)
+    n = min(len(lead), len(bass))
+    return _to_sound((lead[:n] + bass[:n]) * 0.6)
+
+
+def _build_jump():
+    return _to_sound(_sweep(420, 950, 0.13, wave="square", vol=0.35))
+
+
+def _build_die():
+    return _to_sound(_sweep(700, 90, 0.30, wave="square", vol=0.40))
+
+
+def _build_gameover():
+    beat = 0.16
+    jingle = _seq([("C5", 1.5), ("G4", 1.5), ("E4", 1.5), ("C4", 3)],
+                  beat, wave="square", vol=0.40)
+    return _to_sound(jingle)
+
+
+class Audio:
+    """Procedural sound that degrades gracefully.
+
+    Falls back to silence if the mixer can't start or numpy is missing.
+    Optional real files in assets/ override the synthesized versions:
+        assets/music.ogg (or .wav/.mp3)
+        assets/jump.wav, assets/die.wav, assets/gameover.wav (or .ogg)
+    """
+
+    def __init__(self):
+        self.ok = False
+        self.muted = False
+        self.sfx = {}
+        self.music_sound = None       # synthesized looping Sound
+        self.music_channel = None
+        self.music_file = None        # path, if a real music file is present
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+        except pygame.error:
+            return                    # no audio device -> stay silent
+        self.ok = True
+        self._setup()
+
+    def _setup(self):
+        # Music: prefer a real file; otherwise synthesize (needs numpy).
+        for name in ("music.ogg", "music.wav", "music.mp3"):
+            p = os.path.join(ASSET_DIR, name)
+            if os.path.exists(p):
+                self.music_file = p
+                break
+        if self.music_file is None and np is not None:
+            try:
+                self.music_sound = _build_music()
+            except Exception:
+                self.music_sound = None
+
+        # SFX: prefer files; otherwise synthesize.
+        builders = {"jump": _build_jump, "die": _build_die, "gameover": _build_gameover}
+        for key, builder in builders.items():
+            snd = None
+            for ext in (".wav", ".ogg"):
+                p = os.path.join(ASSET_DIR, key + ext)
+                if os.path.exists(p):
+                    try:
+                        snd = pygame.mixer.Sound(p)
+                    except pygame.error:
+                        snd = None
+                    break
+            if snd is None and np is not None:
+                try:
+                    snd = builder()
+                except Exception:
+                    snd = None
+            if snd is not None:
+                self.sfx[key] = snd
+
+    def start_music(self):
+        if not self.ok:
+            return
+        try:
+            if self.music_file:
+                pygame.mixer.music.load(self.music_file)
+                pygame.mixer.music.set_volume(0.0 if self.muted else 0.5)
+                pygame.mixer.music.play(-1)
+            elif self.music_sound:
+                if self.music_channel:
+                    self.music_channel.stop()
+                self.music_channel = self.music_sound.play(loops=-1)
+                if self.music_channel:
+                    self.music_channel.set_volume(0.0 if self.muted else 1.0)
+        except pygame.error:
+            pass
+
+    def stop_music(self):
+        if not self.ok:
+            return
+        try:
+            if self.music_file:
+                pygame.mixer.music.stop()
+            elif self.music_channel:
+                self.music_channel.stop()
+        except pygame.error:
+            pass
+
+    def play(self, key):
+        if not self.ok or self.muted:
+            return
+        snd = self.sfx.get(key)
+        if snd:
+            snd.play()
+
+    def toggle_mute(self):
+        if not self.ok:
+            return
+        self.muted = not self.muted
+        try:
+            if self.music_file:
+                pygame.mixer.music.set_volume(0.0 if self.muted else 0.5)
+            elif self.music_channel:
+                self.music_channel.set_volume(0.0 if self.muted else 1.0)
+        except pygame.error:
+            pass
+
+
+# --------------------------------------------------------------------------
 # Main game
 # --------------------------------------------------------------------------
 def main():
+    pygame.mixer.pre_init(44100, -16, 2, 512)
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption("Endless Runner — v1")
@@ -326,6 +538,9 @@ def main():
         for k in OBSTACLE_SPECS
     }
     bg_img = load_image("background.png", (WIDTH, GROUND_Y))
+
+    audio = Audio()
+    audio.start_music()
 
     player = Player(player_img)
     obstacles = []
@@ -344,6 +559,7 @@ def main():
         speed = BASE_SPEED
         dist_to_next = random.uniform(min_safe_gap(speed), min_safe_gap(speed) + 220)
         world_offset = 0.0
+        audio.start_music()
 
     def draw_scene():
         if bg_img:
@@ -365,7 +581,8 @@ def main():
                     running = False
                 elif event.key in (pygame.K_SPACE, pygame.K_UP):
                     if state == "play":
-                        player.jump()
+                        if player.jump():
+                            audio.play("jump")
                     elif state == "start":
                         state = "play"
                         reset_game()
@@ -375,6 +592,8 @@ def main():
                 elif event.key == pygame.K_r and state == "gameover":
                     state = "play"
                     reset_game()
+                elif event.key == pygame.K_m:
+                    audio.toggle_mute()
 
         # ---- Update ----
         if state == "play":
@@ -410,6 +629,9 @@ def main():
                 if pr.colliderect(obs.rect):
                     best = max(best, int(score))
                     state = "gameover"
+                    audio.stop_music()
+                    audio.play("die")
+                    audio.play("gameover")
                     break
 
         # ---- Draw ----
@@ -426,7 +648,7 @@ def main():
             screen.blit(title, title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 40)))
             tip = font.render("Press SPACE to start", True, TEXT_COLOR)
             screen.blit(tip, tip.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 10)))
-            ctl = small_font.render("← → move   |   SPACE / ↑ jump   |   ESC quit",
+            ctl = small_font.render("← → move   |   SPACE / ↑ jump   |   M mute   |   ESC quit",
                                     True, TEXT_COLOR)
             screen.blit(ctl, ctl.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 44)))
         elif state == "gameover":
